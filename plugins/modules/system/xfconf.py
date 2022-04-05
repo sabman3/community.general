@@ -107,28 +107,31 @@ RETURN = '''
     - The type of the value that was changed (C(none) for C(get) and C(reset)
       state). Either a single string value or a list of strings for array
       types.
+    - This is a string or a list of strings.
     returned: success
-    type: string or list of strings
+    type: any
     sample: '"int" or ["str", "str", "str"]'
   value:
     description:
     - The value of the preference key after executing the module. Either a
       single string value or a list of strings for array types.
+    - This is a string or a list of strings.
     returned: success
-    type: string or list of strings
+    type: any
     sample: '"192" or ["orange", "yellow", "violet"]'
   previous_value:
     description:
     - The value of the preference key before executing the module (C(none) for
       C(get) state). Either a single string value or a list of strings for array
       types.
+    - This is a string or a list of strings.
     returned: success
-    type: string or list of strings
+    type: any
     sample: '"96" or ["red", "blue", "green"]'
 '''
 
 from ansible_collections.community.general.plugins.module_utils.module_helper import (
-    ModuleHelper, CmdMixin, StateMixin, ArgFormat, ModuleHelperException
+    CmdStateModuleHelper, ArgFormat, ModuleHelperException
 )
 
 
@@ -151,7 +154,7 @@ class XFConfException(Exception):
     pass
 
 
-class XFConfProperty(CmdMixin, StateMixin, ModuleHelper):
+class XFConfProperty(CmdStateModuleHelper):
     change_params = 'value',
     diff_params = 'value',
     output_params = ('property', 'channel', 'value')

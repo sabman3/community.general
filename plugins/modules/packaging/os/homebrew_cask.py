@@ -102,6 +102,12 @@ EXAMPLES = '''
     state: present
     install_options: 'debug,appdir=/Applications'
 
+- name: Install cask with force option
+  community.general.homebrew_cask:
+    name: alfred
+    state: present
+    install_options: force
+
 - name: Allow external app
   community.general.homebrew_cask:
     name: alfred
@@ -140,7 +146,8 @@ EXAMPLES = '''
 import os
 import re
 import tempfile
-from distutils import version
+
+from ansible_collections.community.general.plugins.module_utils.version import LooseVersion
 
 from ansible.module_utils.common.text.converters import to_bytes
 from ansible.module_utils.basic import AnsibleModule
@@ -493,7 +500,7 @@ class HomebrewCask(object):
 
     def _brew_cask_command_is_deprecated(self):
         # The `brew cask` replacements were fully available in 2.6.0 (https://brew.sh/2020/12/01/homebrew-2.6.0/)
-        return version.LooseVersion(self._get_brew_version()) >= version.LooseVersion('2.6.0')
+        return LooseVersion(self._get_brew_version()) >= LooseVersion('2.6.0')
     # /checks ------------------------------------------------------ }}}
 
     # commands ----------------------------------------------------- {{{
@@ -599,7 +606,7 @@ class HomebrewCask(object):
             self.message = 'Invalid cask: {0}.'.format(self.current_cask)
             raise HomebrewCaskException(self.message)
 
-        if self._current_cask_is_installed():
+        if '--force' not in self.install_options and self._current_cask_is_installed():
             self.unchanged_count += 1
             self.message = 'Cask already installed: {0}'.format(
                 self.current_cask,

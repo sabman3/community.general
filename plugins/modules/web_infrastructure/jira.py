@@ -36,15 +36,22 @@ options:
 
   username:
     type: str
-    required: true
     description:
       - The username to log-in with.
+      - Must be used with I(password). Mutually exclusive with I(token).
 
   password:
     type: str
-    required: true
     description:
       - The password to log-in with.
+      - Must be used with I(username).  Mutually exclusive with I(token).
+
+  token:
+    type: str
+    description:
+      - The personal access token to log-in with.
+      - Mutually exclusive with I(username) and I(password).
+    version_added: 4.2.0
 
   project:
     type: str
@@ -151,6 +158,7 @@ options:
      - This is a free-form data structure that can contain arbitrary data. This is passed directly to the JIRA REST API
        (possibly after merging with other required data, as when passed to create). See examples for more information,
        and the JIRA REST API for the structure required for various fields.
+     - When passed to comment, the data structure is merged at the first level since community.general 4.6.0. Useful to add JIRA properties for example.
      - Note that JIRA may not allow changing field values on specific transitions or states.
 
   jql:
@@ -206,7 +214,7 @@ options:
             done.
 
 notes:
-  - "Currently this only works with basic-auth."
+  - "Currently this only works with basic-auth, or tokens."
   - "To use with JIRA Cloud, pass the login e-mail as the I(username) and the API token as I(password)."
 
 author:
@@ -253,6 +261,20 @@ EXAMPLES = r"""
     comment_visibility:
       type: role
       value: Developers
+
+- name: Comment on issue with property to mark it internal
+  community.general.jira:
+    uri: '{{ server }}'
+    username: '{{ user }}'
+    password: '{{ pass }}'
+    issue: '{{ issue.meta.key }}'
+    operation: comment
+    comment: A comment added by Ansible
+    fields:
+      properties:
+        - key: 'sd.public.comment'
+          value:
+            internal: true
 
 # Assign an existing issue using edit
 - name: Assign an issue using free-form fields
@@ -408,8 +430,9 @@ class JIRA(StateModuleHelper):
                 choices=['attach', 'create', 'comment', 'edit', 'update', 'fetch', 'transition', 'link', 'search'],
                 aliases=['command'], required=True
             ),
-            username=dict(type='str', required=True),
-            password=dict(type='str', required=True, no_log=True),
+            username=dict(type='str'),
+            password=dict(type='str', no_log=True),
+            token=dict(type='str', no_log=True),
             project=dict(type='str', ),
             summary=dict(type='str', ),
             description=dict(type='str', ),
@@ -432,6 +455,17 @@ class JIRA(StateModuleHelper):
             validate_certs=dict(default=True, type='bool'),
             account_id=dict(type='str'),
         ),
+        mutually_exclusive=[
+            ['username', 'token'],
+            ['password', 'token'],
+            ['assignee', 'account_id'],
+        ],
+        required_together=[
+            ['username', 'password'],
+        ],
+        required_one_of=[
+            ['username', 'token'],
+        ],
         required_if=(
             ('operation', 'attach', ['issue', 'attachment']),
             ('operation', 'create', ['project', 'issuetype', 'summary']),
@@ -441,7 +475,6 @@ class JIRA(StateModuleHelper):
             ('operation', 'link', ['linktype', 'inwardissue', 'outwardissue']),
             ('operation', 'search', ['jql']),
         ),
-        mutually_exclusive=[('assignee', 'account_id')],
         supports_check_mode=False
     )
 
@@ -483,6 +516,10 @@ class JIRA(StateModuleHelper):
         # if comment_visibility is specified restrict visibility
         if self.vars.comment_visibility is not None:
             data['visibility'] = self.vars.comment_visibility
+
+        # Use 'fields' to merge in any additional data
+        if self.vars.fields:
+            data.update(self.vars.fields)
 
         url = self.vars.restbase + '/issue/' + self.vars.issue + '/comment'
         self.vars.meta = self.post(url, data)
@@ -642,23 +679,30 @@ class JIRA(StateModuleHelper):
         if data and content_type == 'application/json':
             data = json.dumps(data)
 
+        headers = {}
+        if isinstance(additional_headers, dict):
+            headers = additional_headers.copy()
+
         # NOTE: fetch_url uses a password manager, which follows the
         # standard request-then-challenge basic-auth semantics. However as
         # JIRA allows some unauthorised operations it doesn't necessarily
         # send the challenge, so the request occurs as the anonymous user,
         # resulting in unexpected results. To work around this we manually
-        # inject the basic-auth header up-front to ensure that JIRA treats
+        # inject the auth header up-front to ensure that JIRA treats
         # the requests as authorized for this user.
-        auth = to_text(base64.b64encode(to_bytes('{0}:{1}'.format(self.vars.username, self.vars.password),
-                                                 errors='surrogate_or_strict')))
 
-        headers = {}
-        if isinstance(additional_headers, dict):
-            headers = additional_headers.copy()
-        headers.update({
-            "Content-Type": content_type,
-            "Authorization": "Basic %s" % auth,
-        })
+        if self.vars.token is not None:
+            headers.update({
+                "Content-Type": content_type,
+                "Authorization": "Bearer %s" % self.vars.token,
+            })
+        else:
+            auth = to_text(base64.b64encode(to_bytes('{0}:{1}'.format(self.vars.username, self.vars.password),
+                                                     errors='surrogate_or_strict')))
+            headers.update({
+                "Content-Type": content_type,
+                "Authorization": "Basic %s" % auth,
+            })
 
         response, info = fetch_url(
             self.module, url, data=data, method=method, timeout=self.vars.timeout, headers=headers
@@ -669,7 +713,14 @@ class JIRA(StateModuleHelper):
             try:
                 error = json.loads(info['body'])
             except Exception:
-                self.module.fail_json(msg=to_native(info['body']), exception=traceback.format_exc())
+                msg = 'The request "{method} {url}" returned the unexpected status code {status} {msg}\n{body}'.format(
+                    status=info['status'],
+                    msg=info['msg'],
+                    body=info.get('body'),
+                    url=url,
+                    method=method,
+                )
+                self.module.fail_json(msg=to_native(msg), exception=traceback.format_exc())
             if error:
                 msg = []
                 for key in ('errorMessages', 'errors'):

@@ -64,6 +64,7 @@ options:
         choices:
             - ldap
             - kerberos
+            - sssd
 
     provider_type:
         description:
@@ -83,9 +84,10 @@ options:
     config:
         description:
             - Dict specifying the configuration options for the provider; the contents differ depending on
-              the value of I(provider_id). Examples are given below for C(ldap) and C(kerberos). It is easiest
-              to obtain valid config values by dumping an already-existing user federation configuration
-              through check-mode in the I(existing) field.
+              the value of I(provider_id). Examples are given below for C(ldap), C(kerberos) and C(sssd).
+              It is easiest to obtain valid config values by dumping an already-existing user federation
+              configuration through check-mode in the I(existing) field.
+            - The value C(sssd) has been supported since community.general 4.2.0.
         type: dict
         suboptions:
             enabled:
@@ -531,6 +533,22 @@ EXAMPLES = '''
         allowPasswordAuthentication: false
         updateProfileFirstLogin: false
 
+  - name: Create sssd user federation
+    community.general.keycloak_user_federation:
+      auth_keycloak_url: https://keycloak.example.com/auth
+      auth_realm: master
+      auth_username: admin
+      auth_password: password
+      realm: my-realm
+      name: my-sssd
+      state: present
+      provider_id: sssd
+      provider_type: org.keycloak.storage.UserStorageProvider
+      config:
+        priority: 0
+        enabled: true
+        cachePolicy: DEFAULT
+
   - name: Delete user federation
     community.general.keycloak_user_federation:
       auth_keycloak_url: https://keycloak.example.com/auth
@@ -765,7 +783,7 @@ def main():
         realm=dict(type='str', default='master'),
         id=dict(type='str'),
         name=dict(type='str'),
-        provider_id=dict(type='str', aliases=['providerId'], choices=['ldap', 'kerberos']),
+        provider_id=dict(type='str', aliases=['providerId'], choices=['ldap', 'kerberos', 'sssd']),
         provider_type=dict(type='str', aliases=['providerType'], default='org.keycloak.storage.UserStorageProvider'),
         parent_id=dict(type='str', aliases=['parentId']),
         mappers=dict(type='list', elements='dict', options=mapper_spec),
@@ -827,7 +845,7 @@ def main():
         before_comp = {}
 
     # if user federation exists, get associated mappers
-    if cid is not None:
+    if cid is not None and before_comp:
         before_comp['mappers'] = sorted(kc.get_components(urlencode(dict(parent=cid)), realm), key=lambda x: x.get('name'))
 
     # Build a proposed changeset from parameters given to this module
@@ -843,8 +861,8 @@ def main():
 
     # special handling of mappers list to allow change detection
     if module.params.get('mappers') is not None:
-        if module.params['provider_id'] == 'kerberos':
-            module.fail_json(msg='Cannot configure mappers for Kerberos federations.')
+        if module.params['provider_id'] in ['kerberos', 'sssd']:
+            module.fail_json(msg='Cannot configure mappers for {type} provider.'.format(type=module.params['provider_id']))
         for change in module.params['mappers']:
             change = dict((k, v) for k, v in change.items() if change[k] is not None)
             if change.get('id') is None and change.get('name') is None:
@@ -903,12 +921,23 @@ def main():
         after_comp = kc.create_component(desired_comp, realm)
 
         for mapper in updated_mappers:
-            if mapper.get('id') is not None:
-                kc.update_component(mapper, realm)
+            found = kc.get_components(urlencode(dict(parent=cid, name=mapper['name'])), realm)
+            if len(found) > 1:
+                module.fail_json(msg='Found multiple mappers with name `{name}`. Cannot continue.'.format(name=mapper['name']))
+            if len(found) == 1:
+                old_mapper = found[0]
             else:
-                if mapper.get('parentId') is None:
-                    mapper['parentId'] = after_comp['id']
-                mapper = kc.create_component(mapper, realm)
+                old_mapper = {}
+
+            new_mapper = old_mapper.copy()
+            new_mapper.update(mapper)
+
+            if new_mapper.get('id') is not None:
+                kc.update_component(new_mapper, realm)
+            else:
+                if new_mapper.get('parentId') is None:
+                    new_mapper['parentId'] = after_comp['id']
+                mapper = kc.create_component(new_mapper, realm)
 
         after_comp['mappers'] = updated_mappers
         result['end_state'] = sanitize(after_comp)

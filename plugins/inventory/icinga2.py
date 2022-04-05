@@ -16,7 +16,17 @@ DOCUMENTATION = '''
         - Get inventory hosts from the Icinga2 API.
         - "Uses a configuration file as an inventory source, it must end in
           C(.icinga2.yml) or C(.icinga2.yaml)."
+    extends_documentation_fragment:
+        - constructed
     options:
+      strict:
+        version_added: 4.4.0
+      compose:
+        version_added: 4.4.0
+      groups:
+        version_added: 4.4.0
+      keyed_groups:
+        version_added: 4.4.0
       plugin:
         description: Name of the plugin.
         required: true
@@ -35,13 +45,23 @@ DOCUMENTATION = '''
         type: string
         required: true
       host_filter:
-        description: An Icinga2 API valid host filter.
+        description:
+          - An Icinga2 API valid host filter. Leave blank for no filtering
         type: string
         required: false
       validate_certs:
         description: Enables or disables SSL certificate verification.
         type: boolean
         default: true
+      inventory_attr:
+        description:
+          - Allows the override of the inventory name based on different attributes.
+          - This allows for changing the way limits are used.
+          - The current default, C(address), is sometimes not unique or present. We recommend to use C(name) instead.
+        type: string
+        default: address
+        choices: ['name', 'display_name', 'address']
+        version_added: 4.2.0
 '''
 
 EXAMPLES = r'''
@@ -52,6 +72,21 @@ user: ansible
 password: secure
 host_filter: \"linux-servers\" in host.groups
 validate_certs: false
+inventory_attr: name
+groups:
+  # simple name matching
+  webservers: inventory_hostname.startswith('web')
+
+  # using icinga2 template
+  databaseservers: "'db-template' in (icinga2_attributes.templates|list)"
+
+compose:
+  # set all icinga2 attributes to a host variable 'icinga2_attrs'
+  icinga2_attrs: icinga2_attributes
+
+  # set 'ansible_user' and 'ansible_port' from icinga2 host vars
+  ansible_user: icinga2_attributes.vars.ansible_user
+  ansible_port: icinga2_attributes.vars.ansible_port | default(22)
 '''
 
 import json
@@ -59,6 +94,7 @@ import json
 from ansible.errors import AnsibleParserError
 from ansible.plugins.inventory import BaseInventoryPlugin, Constructable
 from ansible.module_utils.urls import open_url
+from ansible.module_utils.six.moves.urllib.error import HTTPError
 
 
 class InventoryModule(BaseInventoryPlugin, Constructable):
@@ -76,6 +112,7 @@ class InventoryModule(BaseInventoryPlugin, Constructable):
         self.icinga2_password = None
         self.ssl_verify = None
         self.host_filter = None
+        self.inventory_attr = None
 
         self.cache_key = None
         self.use_cache = None
@@ -114,9 +151,21 @@ class InventoryModule(BaseInventoryPlugin, Constructable):
         if data is not None:
             request_args['data'] = json.dumps(data)
         self.display.vvv("Request Args: %s" % request_args)
-        response = open_url(request_url, **request_args)
+        try:
+            response = open_url(request_url, **request_args)
+        except HTTPError as e:
+            try:
+                error_body = json.loads(e.read().decode())
+                self.display.vvv("Error returned: {0}".format(error_body))
+            except Exception:
+                error_body = {"status": None}
+            if e.code == 404 and error_body.get('status') == "No objects found.":
+                raise AnsibleParserError("Host filter returned no data. Please confirm your host_filter value is valid")
+            raise AnsibleParserError("Unexpected data returned: {0} -- {1}".format(e, error_body))
+
         response_body = response.read()
         json_data = json.loads(response_body.decode('utf-8'))
+        self.display.vvv("Returned Data: %s" % json.dumps(json_data, indent=4, sort_keys=True))
         if 200 <= response.status <= 299:
             return json_data
         if response.status == 404 and json_data['status'] == "No objects found.":
@@ -155,7 +204,7 @@ class InventoryModule(BaseInventoryPlugin, Constructable):
         """Query for all hosts """
         self.display.vvv("Querying Icinga2 for inventory")
         query_args = {
-            "attrs": ["address", "state_type", "state", "groups"],
+            "attrs": ["address", "address6", "name", "display_name", "state_type", "state", "templates", "groups", "vars", "zone"],
         }
         if self.host_filter is not None:
             query_args['host_filter'] = self.host_filter
@@ -164,6 +213,12 @@ class InventoryModule(BaseInventoryPlugin, Constructable):
         # Manipulate returned API data to Ansible inventory spec
         ansible_inv = self._convert_inv(results_json)
         return ansible_inv
+
+    def _apply_constructable(self, name, variables):
+        strict = self.get_option('strict')
+        self._add_host_to_composed_groups(self.get_option('groups'), variables, name, strict=strict)
+        self._add_host_to_keyed_groups(self.get_option('keyed_groups'), variables, name, strict=strict)
+        self._set_composite_vars(self.get_option('compose'), variables, name, strict=strict)
 
     def _populate(self):
         groups = self._to_json(self.get_inventory_from_icinga())
@@ -177,25 +232,40 @@ class InventoryModule(BaseInventoryPlugin, Constructable):
         """Convert Icinga2 API data to JSON format for Ansible"""
         groups_dict = {"_meta": {"hostvars": {}}}
         for entry in json_data:
-            host_name = entry['name']
             host_attrs = entry['attrs']
+            if self.inventory_attr == "name":
+                host_name = entry.get('name')
+            if self.inventory_attr == "address":
+                # When looking for address for inventory, if missing fallback to object name
+                if host_attrs.get('address', '') != '':
+                    host_name = host_attrs.get('address')
+                else:
+                    host_name = entry.get('name')
+            if self.inventory_attr == "display_name":
+                host_name = host_attrs.get('display_name')
             if host_attrs['state'] == 0:
                 host_attrs['state'] = 'on'
             else:
                 host_attrs['state'] = 'off'
-            host_groups = host_attrs['groups']
-            host_addr = host_attrs['address']
-            self.inventory.add_host(host_addr)
+            host_groups = host_attrs.get('groups')
+            self.inventory.add_host(host_name)
             for group in host_groups:
                 if group not in self.inventory.groups.keys():
                     self.inventory.add_group(group)
-                self.inventory.add_child(group, host_addr)
-            self.inventory.set_variable(host_addr, 'address', host_addr)
-            self.inventory.set_variable(host_addr, 'hostname', host_name)
-            self.inventory.set_variable(host_addr, 'state',
+                self.inventory.add_child(group, host_name)
+            # If the address attribute is populated, override ansible_host with the value
+            if host_attrs.get('address') != '':
+                self.inventory.set_variable(host_name, 'ansible_host', host_attrs.get('address'))
+            self.inventory.set_variable(host_name, 'hostname', entry.get('name'))
+            self.inventory.set_variable(host_name, 'display_name', host_attrs.get('display_name'))
+            self.inventory.set_variable(host_name, 'state',
                                         host_attrs['state'])
-            self.inventory.set_variable(host_addr, 'state_type',
+            self.inventory.set_variable(host_name, 'state_type',
                                         host_attrs['state_type'])
+            # Adds all attributes to a variable 'icinga2_attributes'
+            construct_vars = dict(self.inventory.get_host(host_name).get_vars())
+            construct_vars['icinga2_attributes'] = host_attrs
+            self._apply_constructable(host_name, construct_vars)
         return groups_dict
 
     def parse(self, inventory, loader, path, cache=True):
@@ -211,6 +281,7 @@ class InventoryModule(BaseInventoryPlugin, Constructable):
         self.icinga2_password = self.get_option('password')
         self.ssl_verify = self.get_option('validate_certs')
         self.host_filter = self.get_option('host_filter')
+        self.inventory_attr = self.get_option('inventory_attr')
         # Not currently enabled
         # self.cache_key = self.get_cache_key(path)
         # self.use_cache = cache and self.get_option('cache')
